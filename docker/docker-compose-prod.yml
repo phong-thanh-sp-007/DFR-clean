@@ -1,0 +1,135 @@
+version: "3.9"
+name: django-drf-clean-architecture-base
+services:
+  redis:
+    container_name: redis
+    image: redis
+    restart: always
+    networks:
+      - networkbackend
+    command: redis-server --save 60 1 --loglevel warning
+
+  seq:
+    image: datalust/seq:latest
+    container_name: seq
+    restart: always
+    networks:
+      - networkbackend
+      - networkfront
+    ports:
+      - "5341:80"
+    environment:
+      - ACCEPT_EULA=Y
+      - SEQ_LICENSE_KEY=your-license-key-here
+    volumes:
+      - seq-data:/data
+
+  db:
+    container_name: db
+    image: postgres:alpine
+    restart: always
+    networks:
+      - networkdb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    env_file:
+      - ../envs/prod/db/.env
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: backend
+    networks:
+      - networkbackend
+      - networkfront
+      - networkdb
+    restart: always
+    command: sh -c "python3 manage.py migrate --noinput && python3 manage.py init_admin && python3 manage.py collectstatic --noinput && gunicorn infrastructure.server.wsgi --bind 0.0.0.0:8000"
+    volumes:
+      - ../src:/app
+      - static_volume:/app/presentation/static
+      - media_volume:/app/presentation/media
+    depends_on:
+      db:
+        condition: service_healthy
+      seq:
+        condition: service_started
+      redis:
+        condition: service_started
+    ports:
+      - "8000:8000"
+    env_file:
+      - ../envs/prod/backend/.env
+
+  worker:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    command: celery -A infrastructure.celery.celery:app worker --loglevel=info
+    restart: always
+    networks:
+      - networkbackend
+      - networkdb
+    volumes:
+      - ../src:/app
+    env_file:
+      - ../envs/prod/backend/.env
+    depends_on:
+      - backend
+  
+  beat:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: beat
+    command: celery -A infrastructure.celery.celery:app beat --loglevel=info
+    restart: always
+    networks:
+      - networkbackend
+      - networkdb
+    volumes:
+      - ../src:/app
+    env_file:
+      - ../envs/prod/backend/.env
+    depends_on:
+      - worker
+
+  nginx:
+    image: nginx
+    container_name: nginx
+    restart: always
+    networks:
+      - networkfront
+    ports: 
+      - "80:80"
+    volumes:
+      - ../nginx/default.conf:/etc/nginx/conf.d/default.conf
+      - static_volume:/home/app/presentation/static
+      - media_volume:/home/app/presentation/media
+    depends_on:
+      - backend
+      - worker
+      - beat
+
+networks:
+  networkbackend:
+    driver: bridge
+    name: networkBackend
+  networkfront:
+    driver: bridge
+    name: networkFront
+  networkdb:
+    driver: bridge
+    name: networkDB
+
+volumes:
+  seq-data:
+  static_volume:
+  media_volume:
+  postgres_data:
